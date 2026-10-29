@@ -85,15 +85,12 @@ jobs:
           path: dist/livecaptran-*
           if-no-files-found: error
 
-  # v* tag -> versioned release; push to main -> rolling "latest" release
   release:
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    concurrency:
-      group: release-${{ github.ref }}
 
     steps:
       - uses: actions/download-artifact@v7
@@ -101,20 +98,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish GitHub Release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes
-          else
-            gh release delete latest --cleanup-tag --yes || true
-            gh release create latest dist/* \
-              --target "$GITHUB_SHA" \
-              --title "Latest build (${GITHUB_SHA::7})" \
-              --notes "Built automatically from $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA" \
-              --latest
-          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

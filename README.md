@@ -52,16 +52,13 @@ On first run, a `settings.yml` file is created next to the binary with default s
 
 ## CI
 
-GitHub Actions builds for all three platforms. See `.github/workflows/build.yml`. Builds are published to [Releases](https://github.com/kasra-org/livecaptran/releases):
+GitHub Actions builds for all three platforms on push to `main`. See `.github/workflows/build.yml`. Download artifacts from the Actions tab (kept for 90 days).
 
-- Every push to `main` replaces the rolling **Latest build** release (tag `latest`).
-- Pushing a `v*` tag creates a permanent versioned release:
+Pushing a `v*` tag also publishes the archives as a GitHub Release:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.1.0 && git push origin v0.1.0
 ```
-
-Direct download links for the newest build: `https://github.com/kasra-org/livecaptran/releases/latest/download/<archive>`
 
 | Platform | Target | Archive |
 |----------|--------|---------|
