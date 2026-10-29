@@ -8,6 +8,10 @@
 //   - at max length: force a cut at the quietest point of the last 2s
 // "Quiet" is below the silence threshold, or well below the phrase's own speech
 // level, since gaps between words in fast speech seldom reach true silence.
+//
+// Noise handling: the threshold rises with the background level (the quietest moment
+// of the last 10s), and only voiced frames (with a pitch) can start a phrase, so fans,
+// hiss, clicks and breaths don't. Phrases with too little voiced audio are dropped.
 
 use std::collections::VecDeque;
 
@@ -20,6 +24,13 @@ const TAIL_FRAMES: usize = 2; // quiet frames kept at the end so the last syllab
 const PRE_ROLL_FRAMES: usize = 4; // frames kept before onset so the first syllable isn't clipped
 const FORCED_CUT_WINDOW_SECS: f32 = 2.0;
 const MIN_SEND_SECS: f32 = 0.5; // shorter phrases are dropped as noise
+const NOISE_WINDOW_FRAMES: usize = 200; // 10s; background = quietest frame in this window
+const NOISE_WARMUP_FRAMES: usize = 40; // 2s of history before trusting the estimate
+const NOISE_MARGIN: f32 = 3.0; // speech must be this much louder than the background
+const MAX_AUTO_THRESHOLD: f32 = 0.1;
+const SPEECH_QUIET_RATIO: f32 = 0.4; // within a phrase, never call frames above 40% of its level quiet
+const VOICED_CORR: f32 = 0.6; // pitch periodicity that counts as voiced
+const MIN_VOICED_FRAMES: usize = 4; // phrases with less voiced audio (200ms) are noise
 
 fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -28,17 +39,41 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+/// Peak normalized autocorrelation over 70–400 Hz pitch lags: near 1 for voiced
+/// speech, low for hiss, hum-free noise, breaths and clicks.
+fn voicing(frame: &[f32], sample_rate: u32) -> f32 {
+    // ~8 kHz is plenty for pitch
+    let step = (sample_rate as usize / 8000).max(1);
+    let x: Vec<f32> = frame
+        .chunks(step)
+        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+        .collect();
+    let mean = x.iter().sum::<f32>() / x.len() as f32;
+    let x: Vec<f32> = x.iter().map(|v| v - mean).collect();
+    let rate = sample_rate as usize / step;
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(p, q)| p * q).sum::<f32>();
+    (rate / 400..(rate / 70).min(x.len() / 2))
+        .map(|lag| {
+            let (a, b) = (&x[..x.len() - lag], &x[lag..]);
+            dot(a, b) / (dot(a, a) * dot(b, b)).sqrt().max(1e-12)
+        })
+        .fold(0.0, f32::max)
+}
+
 pub struct Phrase {
     pub samples: Vec<f32>,
     pub continues: bool, // cut at max length while speech goes on
 }
 
 pub struct Segmenter {
+    sample_rate: u32,
     frame_len: usize,
     partial: Vec<f32>,
     pre_roll: VecDeque<Vec<f32>>,
     phrase: Vec<f32>,
     energies: Vec<f32>, // one per frame of `phrase`
+    voiced: Vec<bool>,  // one per frame of `phrase`
+    history: VecDeque<f32>, // recent frame energies, for the background level
     speaking: bool,
     quiet_run: usize,
 }
@@ -46,11 +81,14 @@ pub struct Segmenter {
 impl Segmenter {
     pub fn new(sample_rate: u32) -> Self {
         Self {
+            sample_rate,
             frame_len: (sample_rate as usize / FRAMES_PER_SEC).max(1),
             partial: Vec::new(),
             pre_roll: VecDeque::new(),
             phrase: Vec::new(),
             energies: Vec::new(),
+            voiced: Vec::new(),
+            history: VecDeque::new(),
             speaking: false,
             quiet_run: 0,
         }
@@ -61,13 +99,28 @@ impl Segmenter {
         self.pre_roll.clear();
         self.phrase.clear();
         self.energies.clear();
+        self.voiced.clear();
         self.speaking = false;
         self.quiet_run = 0;
     }
 
-    /// The phrase being spoken right now, if any.
+    /// The phrase being spoken right now, once it has enough voiced audio.
     pub fn current(&self) -> Option<&[f32]> {
-        (self.speaking && !self.phrase.is_empty()).then_some(self.phrase.as_slice())
+        let voiced = self.voiced.iter().filter(|&&v| v).count();
+        (self.speaking && voiced >= MIN_VOICED_FRAMES).then_some(self.phrase.as_slice())
+    }
+
+    /// The user's threshold, raised above the background level once it is known.
+    fn effective_threshold(&self, threshold: f32) -> f32 {
+        if self.history.len() < NOISE_WARMUP_FRAMES {
+            return threshold;
+        }
+        let floor = self.history.iter().copied().fold(f32::MAX, f32::min);
+        threshold.max((floor * NOISE_MARGIN).min(MAX_AUTO_THRESHOLD))
+    }
+
+    fn is_voiced(&self, frame: &[f32]) -> bool {
+        voicing(frame, self.sample_rate) > VOICED_CORR
     }
 
     /// Feeds samples and returns any phrases completed by them.
@@ -101,15 +154,23 @@ impl Segmenter {
         out: &mut Vec<Phrase>,
     ) {
         let energy = rms(frame);
+        self.history.push_back(energy);
+        if self.history.len() > NOISE_WINDOW_FRAMES {
+            self.history.pop_front();
+        }
+        // Pitch decides what is speech; only starting a phrase also needs the level
+        // to clear the background
+        let voiced = energy > threshold && self.is_voiced(frame);
+        let threshold = self.effective_threshold(threshold);
 
         if !self.speaking {
-            if energy > threshold {
+            if voiced && energy > threshold {
                 self.speaking = true;
                 self.quiet_run = 0;
                 for f in std::mem::take(&mut self.pre_roll) {
-                    self.append(&f, rms(&f));
+                    self.append(&f, rms(&f), false);
                 }
-                self.append(frame, energy);
+                self.append(frame, energy, true);
             } else {
                 self.pre_roll.push_back(frame.to_vec());
                 if self.pre_roll.len() > PRE_ROLL_FRAMES {
@@ -119,8 +180,16 @@ impl Segmenter {
             return;
         }
 
-        self.append(frame, energy);
-        if energy <= threshold || energy < self.speech_level(threshold) * DIP_RATIO {
+        self.append(frame, energy, voiced);
+        // In long unbroken speech the background estimate can creep up to soft speech;
+        // the phrase's own level keeps such frames from counting as pauses
+        let level = self.speech_level();
+        let quiet_threshold = if level > 0.0 {
+            threshold.min(level * SPEECH_QUIET_RATIO)
+        } else {
+            threshold
+        };
+        if energy <= quiet_threshold || energy < level * DIP_RATIO {
             self.quiet_run += 1;
         } else {
             self.quiet_run = 0;
@@ -139,6 +208,7 @@ impl Segmenter {
             // Leftover quiet becomes pre-roll for the next phrase
             let rest = self.phrase.split_off(0);
             self.energies.clear();
+            self.voiced.clear();
             for f in rest.chunks_exact(self.frame_len) {
                 self.pre_roll.push_back(f.to_vec());
             }
@@ -158,17 +228,20 @@ impl Segmenter {
         }
     }
 
-    fn append(&mut self, frame: &[f32], energy: f32) {
+    fn append(&mut self, frame: &[f32], energy: f32, voiced: bool) {
         self.phrase.extend_from_slice(frame);
         self.energies.push(energy);
+        self.voiced.push(voiced);
     }
 
-    fn speech_level(&self, threshold: f32) -> f32 {
+    /// Mean energy of the phrase's voiced frames.
+    fn speech_level(&self) -> f32 {
         let (sum, count) = self
             .energies
             .iter()
-            .filter(|&&e| e > threshold)
-            .fold((0.0, 0usize), |(s, c), &e| (s + e, c + 1));
+            .zip(&self.voiced)
+            .filter(|(_, v)| **v)
+            .fold((0.0, 0usize), |(s, c), (&e, _)| (s + e, c + 1));
         if count == 0 { 0.0 } else { sum / count as f32 }
     }
 
@@ -178,7 +251,10 @@ impl Segmenter {
         let rest = self.phrase.split_off(split);
         let head = std::mem::replace(&mut self.phrase, rest);
         self.energies.drain(..frames);
-        if head.len() as f32 >= MIN_SEND_SECS * (self.frame_len * FRAMES_PER_SEC) as f32 {
+        let voiced = self.voiced.drain(..frames).filter(|&v| v).count();
+        if voiced >= MIN_VOICED_FRAMES
+            && head.len() as f32 >= MIN_SEND_SECS * (self.frame_len * FRAMES_PER_SEC) as f32
+        {
             out.push(Phrase { samples: head, continues });
         }
     }
@@ -276,6 +352,51 @@ mod tests {
         let lens = run(&audio);
         assert_eq!(lens.len(), 1, "{lens:?}");
         assert!(lens[0] >= 1.0 && lens[0] <= 1.4, "{lens:?}");
+    }
+
+    // Deterministic white noise with the given RMS
+    fn noise(secs: f32, level: f32, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..(secs * RATE as f32) as usize)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * level * 3f32.sqrt()
+            })
+            .collect()
+    }
+
+    fn mix(a: &mut [f32], b: &[f32]) {
+        for (x, y) in a.iter_mut().zip(b) {
+            *x += y;
+        }
+    }
+
+    #[test]
+    fn background_noise_neither_starts_nor_holds_phrases() {
+        // Steady hiss far above the 0.003 threshold, with two 1.5s utterances in it
+        let mut audio = noise(4.0, 0.02, 1);
+        let mut utterance = signal(1.5, &[]);
+        mix(&mut utterance, &noise(1.5, 0.02, 2));
+        audio.extend(&utterance);
+        audio.extend(noise(2.0, 0.02, 3));
+        audio.extend(&utterance);
+        audio.extend(noise(2.0, 0.02, 4));
+        let lens = run(&audio);
+        assert_eq!(lens.len(), 2, "{lens:?}");
+        for &l in &lens {
+            assert!(l >= 1.4 && l <= 2.0, "{lens:?}");
+        }
+    }
+
+    #[test]
+    fn loud_unvoiced_noise_is_dropped() {
+        // Bursts of hiss and a click: loud, but no pitch
+        let mut audio = silence(1.0);
+        audio.extend(noise(1.0, 0.1, 5));
+        audio.extend(silence(1.0));
+        audio.extend(noise(0.05, 0.5, 6));
+        audio.extend(silence(1.0));
+        assert!(run(&audio).is_empty());
     }
 
     #[test]

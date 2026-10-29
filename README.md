@@ -46,12 +46,26 @@ Binary outputs to `target/release/livecaptran` (or `livecaptran.exe` on Windows)
 On first run, a `settings.yml` file is created next to the binary with default settings (OpenAI API endpoints). Edit this file or use the in-app settings window (gear icon) to configure:
 
 - **Transcribe API URL / Key / Model** - Whisper-compatible transcription endpoint (`whisper-1` for OpenAI, e.g. `large-v3` for faster-whisper-server)
+- **Vocabulary hints** - comma-separated terms (e.g. `TMA, EGFR, Visium`) sent as the Whisper prompt and to the translator, to help with jargon and names
 - **Chat API URL / Key / Model** - Chat completions endpoint for translation
 - **Source language** - Language being spoken
 - **Target language** - Translation target (or "None" to disable)
 - **Display mode** - Show both transcription + translation, or translation only
 - **Font size** and **VAD sensitivity**
 - **Min / Max phrase length** - continuous speech is cut at short pauses within this range
+
+## Testing without a microphone
+
+```bash
+# Play a WAV file in real time instead of the mic (press REC to start)
+livecaptran --input talk.wav
+
+# No window: print caption changes to the terminal
+livecaptran --headless --input talk.wav
+```
+
+The file must be 16-bit PCM WAV, e.g. `ffmpeg -i talk.mp3 -ac 1 -ar 16000 -sample_fmt s16 talk.wav`.
+In headless output, `+` is newly fixed text and `~` the tentative tail. Set **VAD sensitivity** (silence threshold) above the recording's background noise, or Whisper may produce phrases like "감사합니다." from noise.
 
 ## CI
 

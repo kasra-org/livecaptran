@@ -15,6 +15,7 @@ livecaptran/
 │   ├── app.rs
 │   ├── audio.rs      # mic capture + transcription/translation requests
 │   ├── captions.rs   # rolling word-by-word captions
+│   ├── headless.rs   # --headless: print caption changes instead of a window (testing)
 │   ├── segmenter.rs  # splits speech into 2–8s phrases at pauses
 │   ├── settings.rs
 │   ├── streaming.rs  # commits words two consecutive partial transcriptions agree on
@@ -57,7 +58,13 @@ Transcribes audio file to text.
 - Captures live microphone audio, sends chunks to transcription API, displays results in real-time
 - Phrases are cut at pauses between min/max length (settings), forced at the quietest point when max is reached
 - Streaming: the phrase in progress is re-transcribed every 1s; agreed words are shown at once (unconfirmed tail dimmed)
+- Vocabulary hints (settings) go to Whisper as `prompt` and to the translator; output that just recites the terms is dropped
 - Translation streams too: the sentence so far is re-translated on each update, asking the model to keep the on-screen words; translated words two consecutive results agree on are fixed, only the dimmed tail can change
+
+## Testing
+
+- `--input file.wav` plays a 16-bit PCM WAV in real time instead of the mic; `--headless` prints caption changes to stdout
+- Test servers: transcription `http://10.125.208.42:8000/v1/audio/transcriptions` (model `large-v3`), chat `http://10.125.208.42:8080/v1/chat/completions` (model `gemma-4-26b-a4b-it`)
 
 ## Build
 

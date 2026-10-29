@@ -129,6 +129,7 @@ pub struct App {
     edit_api_url: String,
     edit_api_key: String,
     edit_transcribe_model: String,
+    edit_vocabulary: String,
     edit_threshold: f32,
     edit_min_phrase: f32,
     edit_max_phrase: f32,
@@ -147,7 +148,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, input: Option<std::path::PathBuf>) -> Self {
         setup_korean_fonts(&cc.egui_ctx);
 
         let mut visuals = egui::Visuals::dark();
@@ -163,6 +164,7 @@ impl App {
         let edit_api_url = loaded.api_url.clone();
         let edit_api_key = loaded.api_key.clone();
         let edit_transcribe_model = loaded.transcribe_model.clone();
+        let edit_vocabulary = loaded.vocabulary.clone();
         let edit_threshold = loaded.silence_threshold;
         let edit_min_phrase = loaded.min_phrase_secs;
         let edit_max_phrase = loaded.max_phrase_secs;
@@ -185,6 +187,7 @@ impl App {
             running.clone(),
             settings.clone(),
             session_active.clone(),
+            input,
         );
 
         let cog_icon = load_icon(
@@ -209,6 +212,7 @@ impl App {
             edit_api_url,
             edit_api_key,
             edit_transcribe_model,
+            edit_vocabulary,
             edit_threshold,
             edit_min_phrase,
             edit_max_phrase,
@@ -282,6 +286,7 @@ impl eframe::App for App {
             let edit_api_url = &mut self.edit_api_url;
             let edit_api_key = &mut self.edit_api_key;
             let edit_transcribe_model = &mut self.edit_transcribe_model;
+            let edit_vocabulary = &mut self.edit_vocabulary;
             let edit_threshold = &mut self.edit_threshold;
             let edit_min_phrase = &mut self.edit_min_phrase;
             let edit_max_phrase = &mut self.edit_max_phrase;
@@ -300,7 +305,7 @@ impl eframe::App for App {
                 egui::ViewportId::from_hash_of("settings"),
                 egui::ViewportBuilder::default()
                     .with_title("LiveCapTran Settings")
-                    .with_inner_size([550.0, 620.0])
+                    .with_inner_size([550.0, 650.0])
                     .with_resizable(false)
                     .with_minimize_button(false)
                     .with_maximize_button(false)
@@ -333,6 +338,14 @@ impl eframe::App for App {
                                 ui.add(
                                     egui::TextEdit::singleline(edit_transcribe_model)
                                         .desired_width(400.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Vocabulary Hints:");
+                                ui.add(
+                                    egui::TextEdit::singleline(edit_vocabulary)
+                                        .desired_width(400.0)
+                                        .hint_text("Comma-separated terms, e.g. TMA, EGFR, Visium"),
                                 );
                                 ui.end_row();
 
@@ -492,6 +505,7 @@ impl eframe::App for App {
             s.api_url = self.edit_api_url.clone();
             s.api_key = self.edit_api_key.clone();
             s.transcribe_model = self.edit_transcribe_model.clone();
+            s.vocabulary = self.edit_vocabulary.clone();
             s.silence_threshold = self.edit_threshold;
             s.min_phrase_secs = self.edit_min_phrase;
             s.max_phrase_secs = self.edit_max_phrase;
@@ -620,6 +634,7 @@ impl eframe::App for App {
                         self.edit_api_url = s.api_url.clone();
                         self.edit_api_key = s.api_key.clone();
                         self.edit_transcribe_model = s.transcribe_model.clone();
+                        self.edit_vocabulary = s.vocabulary.clone();
                         self.edit_threshold = s.silence_threshold;
                         self.edit_min_phrase = s.min_phrase_secs;
                         self.edit_max_phrase = s.max_phrase_secs;

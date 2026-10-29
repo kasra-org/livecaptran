@@ -1,11 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::captions::Captions;
 use crate::segmenter::Segmenter;
@@ -13,9 +14,10 @@ use crate::settings::Settings;
 use crate::streaming::Agreement;
 
 const PARTIAL_STEP_SECS: f32 = 1.0; // re-transcribe the growing phrase this often
-const PROMPT_CHARS: usize = 200; // recent committed text sent as the Whisper prompt
+const FIRST_PARTIAL_SECS: f32 = 2.0; // shorter clips make Whisper guess stock phrases ("감사합니다.")
 const TRANSLATION_HISTORY: usize = 5; // finished sentences given to the translator as context
 const MAX_SENTENCE_WORDS: usize = 30; // finish long unpunctuated runs as a sentence anyway
+const IDLE_FLUSH_SECS: u64 = 2; // after this long without new words, fix the translation so far
 
 /// Newly committed source text for the translator.
 struct TranslateUpdate {
@@ -61,6 +63,47 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
+/// Reads a 16-bit PCM WAV file as mono samples.
+pub fn read_wav(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a WAV file".into());
+    }
+    let (mut channels, mut rate, mut bits) = (0usize, 0u32, 0u16);
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = &bytes[pos + 8..(pos + 8 + size).min(bytes.len())];
+        match id {
+            b"fmt " if body.len() >= 16 => {
+                channels = u16::from_le_bytes([body[2], body[3]]) as usize;
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                bits = u16::from_le_bytes([body[14], body[15]]);
+            }
+            b"data" => {
+                if bits != 16 || channels == 0 {
+                    return Err("only 16-bit PCM WAV is supported".into());
+                }
+                let samples = body
+                    .chunks_exact(2 * channels)
+                    .map(|frame| {
+                        frame
+                            .chunks_exact(2)
+                            .map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0)
+                            .sum::<f32>()
+                            / channels as f32
+                    })
+                    .collect();
+                return Ok((samples, rate));
+            }
+            _ => {}
+        }
+        pos += 8 + size + (size & 1);
+    }
+    Err("no audio data in WAV file".into())
+}
+
 fn chat(
     client: &reqwest::blocking::Client,
     chat_api_url: &str,
@@ -100,19 +143,23 @@ fn translate_sentence(
     chat_api_key: &str,
     chat_model: &str,
     target_language: &str,
+    vocabulary: &str,
     history: &VecDeque<(String, String)>,
     source: &str,
     on_screen: &str,
     complete: bool,
 ) -> Option<String> {
-    let system = format!(
+    let mut system = format!(
         "You are a real-time translator for a scientific presentation. Speech arrives in pieces, so you translate each sentence while it is still being spoken. Translate into {}. Preserve technical and scientific terminology accurately. You receive the source sentence so far and the translation currently on screen. Reply with the full translation of the source so far. Viewers are already reading the on-screen translation, so keep it word for word as the start of your reply whenever possible and change a word only if the new source makes it wrong. Do not guess what the speaker has not said yet. Print only the translation and absolutely nothing else—no alternatives, explanations, notes, or quotation marks.",
         target_language
     );
+    if !vocabulary.trim().is_empty() {
+        system.push_str(&format!(" Terms that may appear: {}.", vocabulary.trim()));
+    }
 
     let mut user = String::new();
     if !history.is_empty() {
-        user.push_str("Earlier sentences (context):\n");
+        user.push_str("Earlier sentences, already on screen (context only, do not translate them again):\n");
         for (src, tr) in history {
             user.push_str(&format!("{src} => {tr}\n"));
         }
@@ -141,7 +188,7 @@ fn transcribe(
     api_key: &str,
     transcribe_model: &str,
     language: &str,
-    prompt: &str,
+    vocabulary: &str,
 ) -> Option<String> {
     let wav = encode_wav(samples, rate);
     let mut form = reqwest::blocking::multipart::Form::new()
@@ -154,8 +201,9 @@ fn transcribe(
         )
         .text("model", transcribe_model.to_string())
         .text("language", language.to_string());
-    if !prompt.is_empty() {
-        form = form.text("prompt", prompt.to_string());
+    // A fixed term list biases recognition without the echo a rolling transcript causes
+    if !vocabulary.trim().is_empty() {
+        form = form.text("prompt", vocabulary.trim().to_string());
     }
 
     let mut req = client.post(api_url);
@@ -187,6 +235,73 @@ fn append(buf: &mut String, text: &str) {
     buf.push_str(text);
 }
 
+/// Whisper sometimes loops on short or unclear audio ("네. 네. 네. …", counting up).
+fn looks_hallucinated(text: &str, secs: f32) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    // Far more words than anyone says in that time
+    if words.len() as f32 > secs * 6.0 + 3.0 {
+        return true;
+    }
+    // Mostly the same words over and over
+    let unique: HashSet<&str> = words.iter().copied().collect();
+    if words.len() >= 6 && (unique.len() as f32) < words.len() as f32 * 0.5 {
+        return true;
+    }
+    // A short pattern looping, possibly without spaces ("블렉블렉블렉…", "100,100,100,…")
+    let c: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    (1..=6).any(|len| {
+        (0..c.len()).any(|i| {
+            let pattern = &c[i..(i + len).min(c.len())];
+            let repeats = (1..)
+                .take_while(|k| {
+                    let j = i + k * len;
+                    j + len <= c.len() && c[j..j + len] == *pattern
+                })
+                .count();
+            repeats >= 5 && pattern.iter().any(|ch| ch.is_alphanumeric())
+        })
+    })
+}
+
+/// With a vocabulary prompt, Whisper may recite the terms on unclear audio
+/// ("사이브, 도너, 샘플, …"), so drop output made up mostly of the terms themselves.
+fn echoes_vocabulary(text: &str, vocabulary: &str) -> bool {
+    let terms: HashSet<String> = vocabulary.split(',').map(normalize).filter(|t| !t.is_empty()).collect();
+    let words: Vec<String> = text.split_whitespace().map(normalize).filter(|w| !w.is_empty()).collect();
+    if terms.is_empty() || words.len() < 3 {
+        return false;
+    }
+    let exact = words.iter().filter(|w| terms.contains(*w)).count();
+    // A comma-separated list of terms or their variants ("아카이브, 도너스, 아카이브,")
+    let listed = text.matches(',').count() + 1 >= words.len();
+    let variants = words
+        .iter()
+        .filter(|w| terms.iter().any(|t| w.starts_with(t.as_str())))
+        .count();
+    exact as f32 >= words.len() as f32 * 0.7 || (listed && variants * 2 >= words.len())
+}
+
+fn normalize(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+}
+
+/// Some models start the reply with the previous sentence's translation, which they
+/// were given only as context; strip it when most of it is repeated word for word.
+fn strip_repeated_context(reply: &str, previous: &str) -> String {
+    let previous: Vec<String> = previous.split_whitespace().map(normalize).collect();
+    let words: Vec<&str> = reply.split_whitespace().collect();
+    let matched = previous
+        .iter()
+        .zip(&words)
+        .take_while(|(p, w)| **p == normalize(w))
+        .count();
+    if matched >= 4 && matched * 2 >= previous.len() {
+        words[matched..].join(" ")
+    } else {
+        reply.to_string()
+    }
+}
+
 fn ends_sentence(text: &str) -> bool {
     text.trim_end().ends_with(['.', '?', '!', '。', '？', '！'])
 }
@@ -210,8 +325,25 @@ fn spawn_translator(
         let mut source = String::new(); // current sentence so far
         let mut on_screen = String::new(); // its latest translation (fixed + tentative)
         let mut agreement = Agreement::default();
+        let mut flushed = false; // idle flush already done since the last update
 
-        while let Ok(mut update) = updates.recv() {
+        loop {
+            // A pause mid-sentence fixes what has been translated so far, but keeps the
+            // sentence open: closing it would make the next clause re-translate its subject
+            let (mut update, idle) =
+                match updates.recv_timeout(Duration::from_secs(IDLE_FLUSH_SECS)) {
+                    Ok(update) => (update, false),
+                    Err(mpsc::RecvTimeoutError::Timeout) if !source.is_empty() && !flushed => {
+                        let update = TranslateUpdate {
+                            text: String::new(),
+                            sentence_end: false,
+                        };
+                        (update, true)
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+            flushed = idle;
             // Merge queued updates so a slow API doesn't fall behind
             while let Ok(next) = updates.try_recv() {
                 append(&mut update.text, &next.text);
@@ -224,13 +356,14 @@ fn spawn_translator(
                 agreement.reset();
                 continue;
             }
-            let (chat_api_url, chat_api_key, chat_model, target_language) = {
+            let (chat_api_url, chat_api_key, chat_model, target_language, vocabulary) = {
                 let s = settings.lock().unwrap();
                 (
                     s.chat_api_url.clone(),
                     s.chat_api_key.clone(),
                     s.chat_model.clone(),
                     s.target_language.clone(),
+                    s.vocabulary.clone(),
                 )
             };
             if target_language.is_empty() {
@@ -249,15 +382,25 @@ fn spawn_translator(
                 &chat_api_key,
                 &chat_model,
                 &target_language,
+                &vocabulary,
                 &history,
                 &source,
                 &on_screen,
-                sentence_end,
+                sentence_end || idle,
             );
+            let reply = match (reply, history.back()) {
+                (Some(r), Some((_, previous))) => Some(strip_repeated_context(&r, previous)),
+                (r, _) => r,
+            };
             if let Some(full) = reply.as_deref().filter(|t| !t.is_empty()) {
                 on_screen = full.to_string();
                 if !sentence_end {
-                    let (new, tentative) = agreement.partial(full);
+                    let (mut new, mut tentative) = agreement.partial(full);
+                    if idle {
+                        // Feeding the same result again agrees with it, fixing the tail
+                        new.push_str(&agreement.partial(full).0);
+                        tentative.clear();
+                    }
                     let mut caps = captions.lock().unwrap();
                     caps.translation.push(&new);
                     caps.translation.set_tentative(&tentative);
@@ -272,7 +415,7 @@ fn spawn_translator(
                         caps.translation.push(&source);
                     }
                 } else {
-                    caps.translation.push(&agreement.finalize(&on_screen, false));
+                    caps.translation.push(&agreement.finalize(Some(&on_screen), false));
                 }
                 caps.translation.set_tentative("");
                 drop(caps);
@@ -296,12 +439,50 @@ pub fn start_audio_and_transcription(
     running: Arc<AtomicBool>,
     settings: Arc<Mutex<Settings>>,
     session_active: Arc<AtomicBool>,
+    input: Option<PathBuf>,
 ) {
     let audio_buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let sample_rate: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
-    // Audio capture thread
-    {
+    if let Some(path) = input {
+        // Feed a WAV file in real time instead of the microphone, starting with the session
+        let buf = audio_buffer.clone();
+        let sr = sample_rate.clone();
+        let run = running.clone();
+        let active = session_active.clone();
+        thread::spawn(move || {
+            let (samples, rate) = match read_wav(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Failed to read {}: {e}", path.display());
+                    return;
+                }
+            };
+            *sr.lock().unwrap() = rate;
+            while !active.load(Ordering::Relaxed) {
+                if !run.load(Ordering::Relaxed) {
+                    return;
+                }
+                buf.lock().unwrap().extend(std::iter::repeat_n(0.0, rate as usize / 10));
+                thread::sleep(Duration::from_millis(100));
+            }
+            let chunk = rate as usize / 20;
+            let start = Instant::now();
+            // Trailing silence lets the last phrase finish
+            let silence = vec![0.0; rate as usize * 2];
+            for (i, c) in samples.chunks(chunk).chain(silence.chunks(chunk)).enumerate() {
+                if !run.load(Ordering::Relaxed) {
+                    return;
+                }
+                buf.lock().unwrap().extend_from_slice(c);
+                let due = Duration::from_secs_f64((i + 1) as f64 * chunk as f64 / rate as f64);
+                if let Some(wait) = due.checked_sub(start.elapsed()) {
+                    thread::sleep(wait);
+                }
+            }
+        });
+    } else {
+        // Audio capture thread
         let buf = audio_buffer.clone();
         let sr = sample_rate.clone();
         let run = running.clone();
@@ -426,7 +607,6 @@ pub fn start_audio_and_transcription(
             let mut segmenter: Option<Segmenter> = None;
             let mut agreement = Agreement::default();
             let mut last_partial_len = 0usize;
-            let mut context = String::new();
             let mut was_session_active = false;
 
             while run.load(Ordering::Relaxed) {
@@ -467,7 +647,6 @@ pub fn start_audio_and_transcription(
                     }
                     agreement.reset();
                     last_partial_len = 0;
-                    context.clear();
                     // Lets the translator drop its unfinished sentence (it sees the session ended)
                     let _ = translate_tx.send(TranslateUpdate {
                         text: String::new(),
@@ -480,7 +659,7 @@ pub fn start_audio_and_transcription(
                     continue;
                 }
 
-                let (threshold, min_phrase_secs, max_phrase_secs, api_url, api_key, transcribe_model, language, translating) = {
+                let (threshold, min_phrase_secs, max_phrase_secs, api_url, api_key, transcribe_model, language, vocabulary, translating) = {
                     let s = settings.lock().unwrap();
                     (
                         s.silence_threshold,
@@ -490,11 +669,12 @@ pub fn start_audio_and_transcription(
                         s.api_key.clone(),
                         s.transcribe_model.clone(),
                         s.language.clone(),
+                        s.vocabulary.clone(),
                         !s.target_language.is_empty(),
                     )
                 };
-                let transcribe = |samples: &[f32], prompt: &str| {
-                    transcribe(
+                let transcribe = |samples: &[f32]| {
+                    let text = transcribe(
                         &client,
                         samples,
                         rate,
@@ -502,20 +682,18 @@ pub fn start_audio_and_transcription(
                         &api_key,
                         &transcribe_model,
                         &language,
-                        prompt,
-                    )
+                        &vocabulary,
+                    )?;
+                    let secs = samples.len() as f32 / rate as f32;
+                    if looks_hallucinated(&text, secs) || echoes_vocabulary(&text, &vocabulary) {
+                        eprintln!("Dropped likely hallucination: {text}");
+                        return None;
+                    }
+                    Some(text)
                 };
-                let commit = |text: &str, sentence_end: bool, context: &mut String| {
+                let commit = |text: &str, sentence_end: bool| {
                     if !text.trim().is_empty() {
                         captions.lock().unwrap().source.push(text);
-                        append(context, text);
-                        if context.len() > PROMPT_CHARS {
-                            let mut cut = context.len() - PROMPT_CHARS;
-                            while !context.is_char_boundary(cut) {
-                                cut += 1;
-                            }
-                            context.drain(..cut);
-                        }
                     }
                     if translating && (!text.trim().is_empty() || sentence_end) {
                         let _ = translate_tx.send(TranslateUpdate {
@@ -529,29 +707,75 @@ pub fn start_audio_and_transcription(
 
                 // Finished phrases: final transcription commits whatever is left
                 for phrase in seg.push(&new_samples, threshold, min_phrase_secs, max_phrase_secs) {
-                    let text = transcribe(&phrase.samples, &context)
-                        .unwrap_or_else(|| agreement.last());
-                    log_line(&log, &text);
-                    let rest = agreement.finalize(&text, phrase.continues);
-                    // A pause ends the sentence for the translator; a mid-speech cut doesn't
-                    commit(&rest, !phrase.continues || ends_sentence(&rest), &mut context);
+                    let text = transcribe(&phrase.samples);
+                    if let Some(text) = &text {
+                        log_line(&log, text);
+                    }
+                    let rest = agreement.finalize(text.as_deref(), phrase.continues);
+                    // Phrases often end mid-sentence, so only punctuation ends one here
+                    commit(&rest, ends_sentence(text.as_deref().unwrap_or(&rest)));
                     captions.lock().unwrap().source.set_tentative("");
                     last_partial_len = 0;
                 }
 
                 // Phrase in progress: re-transcribe once enough new audio has arrived
                 let step = (rate as f32 * PARTIAL_STEP_SECS) as usize;
+                let first = (rate as f32 * FIRST_PARTIAL_SECS) as usize;
                 if let Some(current) = seg.current() {
-                    if current.len() >= last_partial_len + step {
+                    if current.len() >= (last_partial_len + step).max(first) {
                         last_partial_len = current.len();
-                        if let Some(text) = transcribe(current, &context) {
+                        if let Some(text) = transcribe(current) {
                             let (new, tentative) = agreement.partial(&text);
-                            commit(&new, ends_sentence(&new), &mut context);
+                            commit(&new, ends_sentence(&new));
                             captions.lock().unwrap().source.set_tentative(&tentative);
                         }
                     }
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_hallucinations() {
+        assert!(looks_hallucinated(&"네. ".repeat(27), 2.0));
+        assert!(looks_hallucinated(&(1..=100).map(|n| n.to_string()).collect::<Vec<_>>().join(", "), 8.0));
+        assert!(looks_hallucinated("tml블렉블렉블렉블렉블렉블렉블렉블렉", 2.0));
+        assert!(!looks_hallucinated("사이노스 아카이트 샘플이 22년도에 모은 샘플들하고 24년도에 모은 샘플들하고", 5.0));
+        assert!(!looks_hallucinated("네 맞습니다... 지금 회사로 보낸", 2.0));
+        assert!(!looks_hallucinated("We produced the data while looking at what was sent to the company.", 4.0));
+    }
+
+    #[test]
+    fn detects_vocabulary_echo() {
+        let vocab = "TMA, 사이노스, 도너, 샘플, 블록";
+        assert!(echoes_vocabulary("사이브, 도너, 샘플, 샘플.", vocab));
+        assert!(echoes_vocabulary("TMA, 도너, 블록", vocab));
+        assert!(echoes_vocabulary("아카이브, 도너스, 아카이브,", "아카이브, 도너"));
+        assert!(!echoes_vocabulary("TMA 블록이 있는데", vocab));
+        assert!(!echoes_vocabulary("TMA 블록이 총 두 가지가 있는데", vocab));
+        assert!(!echoes_vocabulary("TMA 블록", vocab));
+        assert!(!echoes_vocabulary("사이브, 도너, 샘플", ""));
+    }
+
+    #[test]
+    fn strips_repeated_previous_translation() {
+        let previous = "This is not data we created ourselves, and when producing those CosMx...";
+        assert_eq!(
+            strip_repeated_context(
+                "This is not data we created ourselves, and when producing those CosMx, it is unclear.",
+                previous
+            ),
+            "it is unclear."
+        );
+        // A reply that merely starts similarly is kept
+        assert_eq!(
+            strip_repeated_context("This is not what we expected.", previous),
+            "This is not what we expected."
+        );
     }
 }

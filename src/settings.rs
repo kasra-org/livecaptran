@@ -82,6 +82,7 @@ pub struct Settings {
     pub api_key: String, // empty = no auth
     #[serde(default = "legacy_transcribe_model")]
     pub transcribe_model: String,
+    pub vocabulary: String, // comma-separated terms sent as the Whisper prompt
     pub silence_threshold: f32,
     pub min_phrase_secs: f32,
     pub max_phrase_secs: f32,
@@ -107,6 +108,7 @@ impl Default for Settings {
             api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key: String::new(),
             transcribe_model: "whisper-1".to_string(),
+            vocabulary: String::new(),
             silence_threshold: 0.003,
             min_phrase_secs: 2.0,
             max_phrase_secs: 8.0,
