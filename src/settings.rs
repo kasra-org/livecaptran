@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SILENCE_CHUNKS_TO_END: usize = 10; // ~500ms at 50ms polling
-pub const MAX_PHRASE_SECS: usize = 30;
-
 // Whisper transcription source languages
 pub const SOURCE_LANGUAGES: &[(&str, &str)] = &[
     ("ko", "Korean"),
@@ -79,10 +76,15 @@ pub enum DisplayMode {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)] // fields missing from older settings.yml files take their defaults
 pub struct Settings {
     pub api_url: String,
     pub api_key: String, // empty = no auth
+    #[serde(default = "legacy_transcribe_model")]
+    pub transcribe_model: String,
     pub silence_threshold: f32,
+    pub min_phrase_secs: f32,
+    pub max_phrase_secs: f32,
     pub language: String,
     pub font_size: f32,
     pub chat_api_url: String,
@@ -94,12 +96,20 @@ pub struct Settings {
     pub input_device: String,    // empty = system default
 }
 
+// settings.yml files written before transcribe_model existed always used large-v3
+fn legacy_transcribe_model() -> String {
+    "large-v3".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key: String::new(),
+            transcribe_model: "whisper-1".to_string(),
             silence_threshold: 0.003,
+            min_phrase_secs: 2.0,
+            max_phrase_secs: 8.0,
             language: "ko".to_string(),
             font_size: 60.0,
             chat_api_url: "https://api.openai.com/v1/chat/completions".to_string(),

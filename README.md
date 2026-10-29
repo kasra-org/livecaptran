@@ -9,6 +9,8 @@ Live Korean speech transcription/translation overlay app. Captures microphone au
 - Configurable via `settings.yml` (created next to the binary on first run)
 - Separate settings window with API URLs, API keys, language selection, and more
 - Frameless, draggable, resizable overlay window
+- Rolling captions that flow in word by word
+- Stays visible over fullscreen presentations (macOS Spaces / Windows topmost). On macOS the app has no Dock icon.
 - Supports 10 source languages (transcription) and 50+ target languages (translation)
 
 ## Prerequisites
@@ -43,12 +45,13 @@ Binary outputs to `target/release/livecaptran` (or `livecaptran.exe` on Windows)
 
 On first run, a `settings.yml` file is created next to the binary with default settings (OpenAI API endpoints). Edit this file or use the in-app settings window (gear icon) to configure:
 
-- **Transcribe API URL / Key** - Whisper-compatible transcription endpoint
+- **Transcribe API URL / Key / Model** - Whisper-compatible transcription endpoint (`whisper-1` for OpenAI, e.g. `large-v3` for faster-whisper-server)
 - **Chat API URL / Key / Model** - Chat completions endpoint for translation
 - **Source language** - Language being spoken
 - **Target language** - Translation target (or "None" to disable)
 - **Display mode** - Show both transcription + translation, or translation only
 - **Font size** and **VAD sensitivity**
+- **Min / Max phrase length** - continuous speech is cut at short pauses within this range
 
 ## CI
 

@@ -2,12 +2,37 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    mpsc, Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
 
-use crate::settings::{DisplayMode, Settings, MAX_PHRASE_SECS, SILENCE_CHUNKS_TO_END};
+use crate::captions::Captions;
+use crate::segmenter::Segmenter;
+use crate::settings::Settings;
+use crate::streaming::Agreement;
+
+const PARTIAL_STEP_SECS: f32 = 1.0; // re-transcribe the growing phrase this often
+const PROMPT_CHARS: usize = 200; // recent committed text sent as the Whisper prompt
+const TRANSLATION_HISTORY: usize = 5; // finished sentences given to the translator as context
+const MAX_SENTENCE_WORDS: usize = 30; // finish long unpunctuated runs as a sentence anyway
+
+/// Newly committed source text for the translator.
+struct TranslateUpdate {
+    text: String,
+    sentence_end: bool,
+}
+
+type SessionLog = Arc<Mutex<Option<std::fs::File>>>;
+
+fn log_line(log: &SessionLog, line: &str) {
+    use std::io::Write;
+    if let Some(file) = log.lock().unwrap().as_mut() {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{now}] {line}");
+        let _ = file.flush();
+    }
+}
 
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let num_samples = samples.len();
@@ -36,38 +61,13 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-}
-
-fn translate_text(
+fn chat(
     client: &reqwest::blocking::Client,
-    text: &str,
     chat_api_url: &str,
     chat_api_key: &str,
     chat_model: &str,
-    target_language: &str,
-    history: &VecDeque<(String, String)>,
+    messages: Vec<serde_json::Value>,
 ) -> Option<String> {
-    let mut messages = vec![serde_json::json!({
-        "role": "system",
-        "content": format!(
-            "You are a real-time translator for a scientific presentation. Translate the following spoken text into {}. Preserve technical and scientific terminology accurately. Output only a single, most probable translation. Print only the translated text and absolutely nothing else—no alternatives, no explanations, no notes, no quotation marks.",
-            target_language
-        )
-    })];
-
-    // Include previous transcription/translation pairs as context
-    for (orig, translated) in history {
-        messages.push(serde_json::json!({"role": "user", "content": orig}));
-        messages.push(serde_json::json!({"role": "assistant", "content": translated}));
-    }
-
-    messages.push(serde_json::json!({"role": "user", "content": text}));
-
     let body = serde_json::json!({
         "model": chat_model,
         "messages": messages
@@ -79,22 +79,11 @@ fn translate_text(
     if !chat_api_key.is_empty() {
         req = req.bearer_auth(chat_api_key);
     }
-    match req
-        .body(body.to_string())
-        .send()
-    {
+    match req.body(body.to_string()).send() {
         Ok(resp) => {
-            if let Ok(body) = resp.text() {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                        let translated = content.trim().to_string();
-                        if !translated.is_empty() {
-                            return Some(translated);
-                        }
-                    }
-                }
-            }
-            None
+            let body = resp.text().ok()?;
+            let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+            Some(json["choices"][0]["message"]["content"].as_str()?.trim().to_string())
         }
         Err(e) => {
             eprintln!("Translation error: {e}");
@@ -103,24 +92,59 @@ fn translate_text(
     }
 }
 
-fn send_transcription(
+/// Translates the sentence so far, asking the model to keep `on_screen` (what viewers are
+/// already reading) word for word wherever it can. Returns None if the request failed.
+fn translate_sentence(
     client: &reqwest::blocking::Client,
-    samples: &[f32],
-    rate: u32,
-    transcript: &Arc<Mutex<String>>,
-    api_url: &str,
-    api_key: &str,
-    language: &str,
     chat_api_url: &str,
     chat_api_key: &str,
     chat_model: &str,
     target_language: &str,
-    display_mode: &DisplayMode,
-    history: &mut VecDeque<(String, String)>,
-    log_file: &mut Option<std::fs::File>,
-) {
+    history: &VecDeque<(String, String)>,
+    source: &str,
+    on_screen: &str,
+    complete: bool,
+) -> Option<String> {
+    let system = format!(
+        "You are a real-time translator for a scientific presentation. Speech arrives in pieces, so you translate each sentence while it is still being spoken. Translate into {}. Preserve technical and scientific terminology accurately. You receive the source sentence so far and the translation currently on screen. Reply with the full translation of the source so far. Viewers are already reading the on-screen translation, so keep it word for word as the start of your reply whenever possible and change a word only if the new source makes it wrong. Do not guess what the speaker has not said yet. Print only the translation and absolutely nothing else—no alternatives, explanations, notes, or quotation marks.",
+        target_language
+    );
+
+    let mut user = String::new();
+    if !history.is_empty() {
+        user.push_str("Earlier sentences (context):\n");
+        for (src, tr) in history {
+            user.push_str(&format!("{src} => {tr}\n"));
+        }
+        user.push('\n');
+    }
+    let status = if complete { " (sentence complete)" } else { "" };
+    user.push_str(&format!("Source so far{status}: {source}\nOn screen: {on_screen}"));
+
+    chat(
+        client,
+        chat_api_url,
+        chat_api_key,
+        chat_model,
+        vec![
+            serde_json::json!({"role": "system", "content": system}),
+            serde_json::json!({"role": "user", "content": user}),
+        ],
+    )
+}
+
+fn transcribe(
+    client: &reqwest::blocking::Client,
+    samples: &[f32],
+    rate: u32,
+    api_url: &str,
+    api_key: &str,
+    transcribe_model: &str,
+    language: &str,
+    prompt: &str,
+) -> Option<String> {
     let wav = encode_wav(samples, rate);
-    let form = reqwest::blocking::multipart::Form::new()
+    let mut form = reqwest::blocking::multipart::Form::new()
         .part(
             "file",
             reqwest::blocking::multipart::Part::bytes(wav)
@@ -128,8 +152,11 @@ fn send_transcription(
                 .mime_str("audio/wav")
                 .unwrap(),
         )
-        .text("model", "large-v3")
+        .text("model", transcribe_model.to_string())
         .text("language", language.to_string());
+    if !prompt.is_empty() {
+        form = form.text("prompt", prompt.to_string());
+    }
 
     let mut req = client.post(api_url);
     if !api_key.is_empty() {
@@ -137,64 +164,135 @@ fn send_transcription(
     }
     match req.multipart(form).send() {
         Ok(resp) => {
-            if let Ok(body) = resp.text() {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(text) = json["text"].as_str() {
-                        let text = text.trim().to_string();
-                        if !text.is_empty() {
-                            let maybe_translated = if !target_language.is_empty() {
-                                translate_text(
-                                    client,
-                                    &text,
-                                    chat_api_url,
-                                    chat_api_key,
-                                    chat_model,
-                                    target_language,
-                                    history,
-                                )
-                            } else {
-                                None
-                            };
-
-                            // Log to session file
-                            if let Some(file) = log_file {
-                                use std::io::Write;
-                                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = writeln!(file, "[{}] {}", now, &text);
-                                if let Some(ref tr) = maybe_translated {
-                                    let _ = writeln!(file, "[{}] {}", now, tr);
-                                }
-                                let _ = writeln!(file, "---");
-                                let _ = file.flush();
-                            }
-
-                            // Build display string
-                            let display = if let Some(translated) = maybe_translated {
-                                history.push_back((text.clone(), translated.clone()));
-                                if history.len() > 3 {
-                                    history.pop_front();
-                                }
-                                match display_mode {
-                                    DisplayMode::TranslationOnly => translated,
-                                    DisplayMode::Both => {
-                                        format!("{text}\n{translated}")
-                                    }
-                                }
-                            } else {
-                                text
-                            };
-                            *transcript.lock().unwrap() = display;
-                        }
-                    }
-                }
-            }
+            let body = resp.text().ok()?;
+            let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+            Some(json["text"].as_str()?.trim().to_string())
         }
-        Err(e) => eprintln!("Transcription error: {e}"),
+        Err(e) => {
+            eprintln!("Transcription error: {e}");
+            None
+        }
     }
 }
 
+/// Appends `text` to `buf` with a separating space.
+fn append(buf: &mut String, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !buf.is_empty() && !buf.ends_with(char::is_whitespace) {
+        buf.push(' ');
+    }
+    buf.push_str(text);
+}
+
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end().ends_with(['.', '?', '!', '。', '？', '！'])
+}
+
+// Streams the translation of committed source text, off the transcription thread so it
+// never delays it. The current sentence is re-translated on each update; translated words
+// two consecutive results agree on are fixed, and only the dimmed tail may still change.
+fn spawn_translator(
+    updates: mpsc::Receiver<TranslateUpdate>,
+    captions: Arc<Mutex<Captions>>,
+    settings: Arc<Mutex<Settings>>,
+    session_active: Arc<AtomicBool>,
+    log: SessionLog,
+) {
+    thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client");
+        let mut history: VecDeque<(String, String)> = VecDeque::new();
+        let mut source = String::new(); // current sentence so far
+        let mut on_screen = String::new(); // its latest translation (fixed + tentative)
+        let mut agreement = Agreement::default();
+
+        while let Ok(mut update) = updates.recv() {
+            // Merge queued updates so a slow API doesn't fall behind
+            while let Ok(next) = updates.try_recv() {
+                append(&mut update.text, &next.text);
+                update.sentence_end = next.sentence_end;
+            }
+            if !session_active.load(Ordering::Relaxed) {
+                history.clear();
+                source.clear();
+                on_screen.clear();
+                agreement.reset();
+                continue;
+            }
+            let (chat_api_url, chat_api_key, chat_model, target_language) = {
+                let s = settings.lock().unwrap();
+                (
+                    s.chat_api_url.clone(),
+                    s.chat_api_key.clone(),
+                    s.chat_model.clone(),
+                    s.target_language.clone(),
+                )
+            };
+            if target_language.is_empty() {
+                continue;
+            }
+
+            append(&mut source, &update.text);
+            if source.is_empty() {
+                continue;
+            }
+            let sentence_end =
+                update.sentence_end || source.split_whitespace().count() >= MAX_SENTENCE_WORDS;
+            let reply = translate_sentence(
+                &client,
+                &chat_api_url,
+                &chat_api_key,
+                &chat_model,
+                &target_language,
+                &history,
+                &source,
+                &on_screen,
+                sentence_end,
+            );
+            if let Some(full) = reply.as_deref().filter(|t| !t.is_empty()) {
+                on_screen = full.to_string();
+                if !sentence_end {
+                    let (new, tentative) = agreement.partial(full);
+                    let mut caps = captions.lock().unwrap();
+                    caps.translation.push(&new);
+                    caps.translation.set_tentative(&tentative);
+                }
+            }
+
+            if sentence_end {
+                let mut caps = captions.lock().unwrap();
+                if on_screen.is_empty() {
+                    // Fall back to the original if translation failed
+                    if reply.is_none() {
+                        caps.translation.push(&source);
+                    }
+                } else {
+                    caps.translation.push(&agreement.finalize(&on_screen, false));
+                }
+                caps.translation.set_tentative("");
+                drop(caps);
+                if !on_screen.is_empty() {
+                    log_line(&log, &format!("→ {on_screen}"));
+                    history.push_back((source.clone(), on_screen.clone()));
+                    if history.len() > TRANSLATION_HISTORY {
+                        history.pop_front();
+                    }
+                }
+                source.clear();
+                on_screen.clear();
+                agreement.reset();
+            }
+        }
+    });
+}
+
 pub fn start_audio_and_transcription(
-    transcript: Arc<Mutex<String>>,
+    captions: Arc<Mutex<Captions>>,
     running: Arc<AtomicBool>,
     settings: Arc<Mutex<Settings>>,
     session_active: Arc<AtomicBool>,
@@ -302,11 +400,21 @@ pub fn start_audio_and_transcription(
         });
     }
 
-    // VAD + transcription thread
+    // Streaming transcription thread: while a phrase is being spoken it is re-sent every
+    // PARTIAL_STEP_SECS; words two consecutive results agree on are shown right away
     {
         let buf = audio_buffer;
         let sr = sample_rate;
         let run = running;
+        let log: SessionLog = Arc::new(Mutex::new(None));
+        let (translate_tx, translate_rx) = mpsc::channel::<TranslateUpdate>();
+        spawn_translator(
+            translate_rx,
+            captions.clone(),
+            settings.clone(),
+            session_active.clone(),
+            log.clone(),
+        );
         thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -315,11 +423,10 @@ pub fn start_audio_and_transcription(
 
             thread::sleep(Duration::from_secs(1));
 
-            let mut speaking = false;
-            let mut phrase: Vec<f32> = Vec::new();
-            let mut silence_count: usize = 0;
-            let mut translation_history: VecDeque<(String, String)> = VecDeque::new();
-            let mut log_file: Option<std::fs::File> = None;
+            let mut segmenter: Option<Segmenter> = None;
+            let mut agreement = Agreement::default();
+            let mut last_partial_len = 0usize;
+            let mut context = String::new();
             let mut was_session_active = false;
 
             while run.load(Ordering::Relaxed) {
@@ -348,16 +455,24 @@ pub fn start_audio_and_transcription(
                         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
                     );
                     match std::fs::File::create(dir.join(&filename)) {
-                        Ok(f) => log_file = Some(f),
+                        Ok(f) => *log.lock().unwrap() = Some(f),
                         Err(e) => eprintln!("Failed to create session log: {e}"),
                     }
                     was_session_active = true;
                 } else if !is_active && was_session_active {
-                    log_file = None;
-                    *transcript.lock().unwrap() = String::new();
-                    phrase.clear();
-                    speaking = false;
-                    silence_count = 0;
+                    *log.lock().unwrap() = None;
+                    captions.lock().unwrap().clear();
+                    if let Some(seg) = &mut segmenter {
+                        seg.reset();
+                    }
+                    agreement.reset();
+                    last_partial_len = 0;
+                    context.clear();
+                    // Lets the translator drop its unfinished sentence (it sees the session ended)
+                    let _ = translate_tx.send(TranslateUpdate {
+                        text: String::new(),
+                        sentence_end: false,
+                    });
                     was_session_active = false;
                 }
 
@@ -365,69 +480,77 @@ pub fn start_audio_and_transcription(
                     continue;
                 }
 
-                let (threshold, api_url, api_key, language, chat_api_url, chat_api_key, chat_model, target_language, display_mode) = {
+                let (threshold, min_phrase_secs, max_phrase_secs, api_url, api_key, transcribe_model, language, translating) = {
                     let s = settings.lock().unwrap();
                     (
                         s.silence_threshold,
+                        s.min_phrase_secs,
+                        s.max_phrase_secs,
                         s.api_url.clone(),
                         s.api_key.clone(),
+                        s.transcribe_model.clone(),
                         s.language.clone(),
-                        s.chat_api_url.clone(),
-                        s.chat_api_key.clone(),
-                        s.chat_model.clone(),
-                        s.target_language.clone(),
-                        s.display_mode.clone(),
+                        !s.target_language.is_empty(),
                     )
                 };
-
-                let energy = rms(&new_samples);
-                let is_voice = energy > threshold;
-
-                if speaking {
-                    phrase.extend_from_slice(&new_samples);
-
-                    if is_voice {
-                        silence_count = 0;
-                    } else {
-                        silence_count += 1;
-                    }
-
-                    // End of phrase: sustained silence after speech
-                    let phrase_too_long = phrase.len() > rate as usize * MAX_PHRASE_SECS;
-                    if silence_count >= SILENCE_CHUNKS_TO_END || phrase_too_long {
-                        // Trim trailing silence
-                        let trim_samples = silence_count * new_samples.len();
-                        let end = phrase.len().saturating_sub(trim_samples);
-                        if end > rate as usize / 2 {
-                            send_transcription(
-                                &client,
-                                &phrase[..end],
-                                rate,
-                                &transcript,
-                                &api_url,
-                                &api_key,
-                                &language,
-                                &chat_api_url,
-                                &chat_api_key,
-                                &chat_model,
-                                &target_language,
-                                &display_mode,
-                                &mut translation_history,
-                                &mut log_file,
-                            );
+                let transcribe = |samples: &[f32], prompt: &str| {
+                    transcribe(
+                        &client,
+                        samples,
+                        rate,
+                        &api_url,
+                        &api_key,
+                        &transcribe_model,
+                        &language,
+                        prompt,
+                    )
+                };
+                let commit = |text: &str, sentence_end: bool, context: &mut String| {
+                    if !text.trim().is_empty() {
+                        captions.lock().unwrap().source.push(text);
+                        append(context, text);
+                        if context.len() > PROMPT_CHARS {
+                            let mut cut = context.len() - PROMPT_CHARS;
+                            while !context.is_char_boundary(cut) {
+                                cut += 1;
+                            }
+                            context.drain(..cut);
                         }
-                        phrase.clear();
-                        speaking = false;
-                        silence_count = 0;
                     }
-                } else if is_voice {
-                    // Speech started
-                    speaking = true;
-                    silence_count = 0;
-                    phrase.clear();
-                    phrase.extend_from_slice(&new_samples);
+                    if translating && (!text.trim().is_empty() || sentence_end) {
+                        let _ = translate_tx.send(TranslateUpdate {
+                            text: text.to_string(),
+                            sentence_end,
+                        });
+                    }
+                };
+
+                let seg = segmenter.get_or_insert_with(|| Segmenter::new(rate));
+
+                // Finished phrases: final transcription commits whatever is left
+                for phrase in seg.push(&new_samples, threshold, min_phrase_secs, max_phrase_secs) {
+                    let text = transcribe(&phrase.samples, &context)
+                        .unwrap_or_else(|| agreement.last());
+                    log_line(&log, &text);
+                    let rest = agreement.finalize(&text, phrase.continues);
+                    // A pause ends the sentence for the translator; a mid-speech cut doesn't
+                    commit(&rest, !phrase.continues || ends_sentence(&rest), &mut context);
+                    captions.lock().unwrap().source.set_tentative("");
+                    last_partial_len = 0;
                 }
-                // If silent and not speaking, discard samples
+
+                // Phrase in progress: re-transcribe once enough new audio has arrived
+                let step = (rate as f32 * PARTIAL_STEP_SECS) as usize;
+                if let Some(current) = seg.current() {
+                    if current.len() >= last_partial_len + step {
+                        last_partial_len = current.len();
+                        if let Some(text) = transcribe(current, &context) {
+                            let (new, tentative) = agreement.partial(&text);
+                            commit(&new, ends_sentence(&new), &mut context);
+                            captions.lock().unwrap().source.set_tentative(&tentative);
+                        }
+                    }
+                }
             }
         });
     }

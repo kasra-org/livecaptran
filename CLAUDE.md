@@ -13,8 +13,12 @@ livecaptran/
 ├── src/              # Rust egui desktop app (frameless overlay window)
 │   ├── main.rs
 │   ├── app.rs
-│   ├── audio.rs
-│   └── settings.rs
+│   ├── audio.rs      # mic capture + transcription/translation requests
+│   ├── captions.rs   # rolling word-by-word captions
+│   ├── segmenter.rs  # splits speech into 2–8s phrases at pauses
+│   ├── settings.rs
+│   ├── streaming.rs  # commits words two consecutive partial transcriptions agree on
+│   └── topmost.rs    # keeps overlay above fullscreen presentations (macOS/Windows)
 ├── Cargo.toml
 └── .github/workflows/
     └── build.yml     # CI: builds for Linux, Windows, macOS
@@ -44,12 +48,16 @@ Transcribes audio file to text.
 
 ## GUI Spec
 
-- Frameless overlay window, screen-wide (left=0), height=500px
+- Frameless overlay window, screen-wide (left=0), height=500px (resizable down to 40px; font shrinks to fit one line)
 - Black semi-transparent background
-- White text, 60pt, centered, auto-wrap
+- White text, 60pt, rolling captions revealed word by word (older lines scroll off the top)
+- Stays above fullscreen presentations: macOS joins all Spaces (app runs as Accessory, no Dock icon); Windows re-asserts topmost
 - Small X close button at top-right
 - Draggable via mouse drag
 - Captures live microphone audio, sends chunks to transcription API, displays results in real-time
+- Phrases are cut at pauses between min/max length (settings), forced at the quietest point when max is reached
+- Streaming: the phrase in progress is re-transcribed every 1s; agreed words are shown at once (unconfirmed tail dimmed)
+- Translation streams too: the sentence so far is re-translated on each update, asking the model to keep the on-screen words; translated words two consecutive results agree on are fixed, only the dimmed tail can change
 
 ## Build
 

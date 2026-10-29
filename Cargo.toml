@@ -16,3 +16,12 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = "0.4"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }

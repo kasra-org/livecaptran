@@ -2049,10 +2049,15 @@ dependencies = [
  "cpal",
  "eframe",
  "image",
+ "objc2 0.6.3",
+ "objc2-app-kit 0.3.2",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "windows-sys 0.59.0",
+ "winit",
 ]
 
 [[package]]
