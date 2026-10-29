@@ -52,10 +52,18 @@ On first run, a `settings.yml` file is created next to the binary with default s
 
 ## CI
 
-GitHub Actions builds for all three platforms on push to `main`. See `.github/workflows/build.yml`. Download artifacts from the Actions tab.
+GitHub Actions builds for all three platforms on push to `main`. See `.github/workflows/build.yml`. Download artifacts from the Actions tab (kept for 90 days).
 
-| Platform | Target | Binary |
-|----------|--------|--------|
-| Linux | `x86_64-unknown-linux-gnu` | `livecaptran` |
-| Windows | `x86_64-pc-windows-msvc` | `livecaptran.exe` |
-| macOS | `aarch64-apple-darwin` | `livecaptran` |
+Pushing a `v*` tag also publishes the archives as a GitHub Release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+| Platform | Target | Archive |
+|----------|--------|---------|
+| Linux | `x86_64-unknown-linux-gnu` | `livecaptran-linux-x86_64.tar.gz` |
+| Windows | `x86_64-pc-windows-msvc` | `livecaptran-windows-x86_64.zip` |
+| macOS | universal (`aarch64` + `x86_64`) | `livecaptran-macos-universal.tar.gz` |
+
+The macOS binary is ad-hoc signed only. On first launch, right-click → Open, or run `xattr -d com.apple.quarantine livecaptran`.

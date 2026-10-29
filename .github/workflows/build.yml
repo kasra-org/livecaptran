@@ -3,34 +3,44 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: build (${{ matrix.name }})
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: livecaptran
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: livecaptran.exe
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: livecaptran
+          - name: linux-x86_64
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -38,11 +48,61 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+          mkdir -p dist
+          tar -czf dist/livecaptran-${{ matrix.name }}.tar.gz -C target/x86_64-unknown-linux-gnu/release livecaptran
 
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/livecaptran.exe -DestinationPath dist/livecaptran-${{ matrix.name }}.zip
+
+      # Universal binary (Apple Silicon + Intel), ad-hoc signed so it runs on Apple Silicon
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist/bin
+          lipo -create -output dist/bin/livecaptran \
+            target/aarch64-apple-darwin/release/livecaptran \
+            target/x86_64-apple-darwin/release/livecaptran
+          codesign --force --sign - dist/bin/livecaptran
+          lipo -info dist/bin/livecaptran
+          tar -czf dist/livecaptran-${{ matrix.name }}.tar.gz -C dist/bin livecaptran
+
+      # Archived before upload so the executable bit survives on Linux/macOS
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: livecaptran-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          name: livecaptran-${{ matrix.name }}
+          path: dist/livecaptran-*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
