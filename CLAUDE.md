@@ -19,7 +19,7 @@ livecaptran/
 │   ├── segmenter.rs  # splits speech into 2–8s phrases at pauses
 │   ├── settings.rs
 │   ├── streaming.rs  # commits words two consecutive partial transcriptions agree on
-│   └── topmost.rs    # keeps overlay above fullscreen presentations (macOS/Windows)
+│   └── topmost.rs    # one overlay per monitor, kept above fullscreen presentations (macOS/Windows)
 ├── Cargo.toml
 └── .github/workflows/
     └── build.yml     # CI: builds for Linux, Windows, macOS
@@ -52,6 +52,7 @@ Transcribes audio file to text.
 - Frameless overlay window, screen-wide (left=0), height=500px (resizable down to 40px; font shrinks to fit one line)
 - Black semi-transparent background
 - White text, 60pt, rolling captions revealed word by word (older lines scroll off the top)
+- One overlay per monitor (macOS/Windows), each snapped to the bottom of its monitor at full width; windows titled "LiveCapTran", "LiveCapTran 2", …
 - Stays above fullscreen presentations: macOS joins all Spaces (app runs as Accessory, no Dock icon); Windows re-asserts topmost
 - Small X close button at top-right
 - Draggable via mouse drag

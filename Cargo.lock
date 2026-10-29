@@ -2043,7 +2043,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "livecaptran"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "cpal",
@@ -2051,7 +2051,7 @@ dependencies = [
  "image",
  "objc2 0.6.3",
  "objc2-app-kit 0.3.2",
- "raw-window-handle",
+ "objc2-foundation 0.3.2",
  "reqwest",
  "serde",
  "serde_json",

@@ -47,6 +47,7 @@ fn load_icon(ctx: &egui::Context, name: &str, png_bytes: &[u8]) -> egui::Texture
 }
 
 const RESIZE_BORDER: f32 = 8.0;
+const PLACE_AFTER_FRAMES: [u32; 2] = [3, 15];
 
 /// Draws wrapped text in `rect`, bottom-aligned, keeping only the newest lines that fit
 /// so older lines scroll off the top. Unconfirmed `tentative` words follow, dimmed.
@@ -118,6 +119,30 @@ fn list_input_devices() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Starts an OS resize when the edge of the viewport is dragged.
+fn handle_edge_resize(ctx: &egui::Context) {
+    let resize_dir = detect_resize_direction(ctx);
+    if let Some(dir) = resize_dir {
+        ctx.set_cursor_icon(match dir {
+            egui::ResizeDirection::North | egui::ResizeDirection::South => {
+                egui::CursorIcon::ResizeVertical
+            }
+            egui::ResizeDirection::East | egui::ResizeDirection::West => {
+                egui::CursorIcon::ResizeHorizontal
+            }
+            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+                egui::CursorIcon::ResizeNwSe
+            }
+            egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
+                egui::CursorIcon::ResizeNeSw
+            }
+        });
+        if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+}
+
 pub struct App {
     captions: Arc<Mutex<Captions>>,
     last_frame: Instant,
@@ -125,6 +150,9 @@ pub struct App {
     running: Arc<AtomicBool>,
     session_active: Arc<AtomicBool>,
     positioned: bool,
+    overlays: usize, // one per monitor
+    last_monitor_check: Instant,
+    place_in: Vec<u32>, // frames until overlays are snapped to their monitors
     show_settings: bool,
     edit_api_url: String,
     edit_api_key: String,
@@ -208,6 +236,9 @@ impl App {
             running,
             session_active,
             positioned: false,
+            overlays: crate::topmost::monitor_count(),
+            last_monitor_check: Instant::now(),
+            place_in: PLACE_AFTER_FRAMES.to_vec(),
             show_settings: false,
             edit_api_url,
             edit_api_key,
@@ -232,6 +263,154 @@ impl App {
     }
 }
 
+impl App {
+    /// Captions, buttons and drag handling for one overlay window.
+    fn draw_overlay(&mut self, ctx: &egui::Context) {
+        let font_size = self.edit_font_size;
+        let panel_frame = egui::Frame::new()
+            .fill(egui::Color32::from_black_alpha(self.edit_opacity))
+            .inner_margin(10.0);
+
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(ctx, |ui| {
+                let panel_rect = ui.max_rect();
+
+                // Drag anywhere to move the window (buttons added later take precedence)
+                let drag = ui.interact(panel_rect, ui.id().with("drag"), egui::Sense::drag());
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                // Rolling captions, leaving a column on the right for the buttons
+                let area = egui::Rect::from_min_max(
+                    panel_rect.left_top(),
+                    egui::pos2(panel_rect.right() - 120.0, panel_rect.bottom()),
+                );
+                // In a short window, shrink the font so at least one line fits
+                let row_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(font_size)));
+                let size = (font_size * (area.height() / row_h).min(1.0)).max(10.0);
+                let big = egui::FontId::proportional(size);
+                let big_row_h = ui.fonts(|f| f.row_height(&big));
+                let caps = self.captions.lock().unwrap();
+                let translating = !self.edit_target_language.is_empty();
+                let main_text = if translating {
+                    caps.translation.parts()
+                } else {
+                    caps.source.parts()
+                };
+                let small = egui::FontId::proportional(size * 0.5);
+                let source_h = ui.fonts(|f| f.row_height(&small)) * 2.0;
+                // Original in two smaller gray lines above the translation, if there's room
+                if translating
+                    && self.edit_display_mode == DisplayMode::Both
+                    && area.height() >= source_h + big_row_h
+                {
+                    let split_y = area.top() + source_h;
+                    let top = egui::Rect::from_min_max(area.left_top(), egui::pos2(area.right(), split_y));
+                    let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), split_y), area.right_bottom());
+                    paint_rolling(ui, top, caps.source.parts(), small, egui::Color32::from_gray(180));
+                    paint_rolling(ui, bottom, main_text, big, egui::Color32::WHITE);
+                } else {
+                    paint_rolling(ui, area, main_text, big, egui::Color32::WHITE);
+                }
+                drop(caps);
+
+                // Session start/stop button: gray "● REC" when idle, red with blinking dot while recording
+                let session_rect = egui::Rect::from_min_size(
+                    egui::pos2(panel_rect.right() - 112.0, panel_rect.top()),
+                    egui::vec2(48.0, 32.0),
+                );
+                let is_active = self.session_active.load(Ordering::Relaxed);
+                let rec_color = if is_active {
+                    egui::Color32::from_rgb(255, 60, 60)
+                } else {
+                    egui::Color32::from_gray(160)
+                };
+                let dot_visible = !is_active || (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+                let mut rec_label = egui::text::LayoutJob::default();
+                rec_label.append(
+                    "● ",
+                    0.0,
+                    egui::TextFormat::simple(
+                        egui::FontId::proportional(12.0),
+                        if dot_visible { rec_color } else { egui::Color32::TRANSPARENT },
+                    ),
+                );
+                rec_label.append(
+                    "REC",
+                    0.0,
+                    egui::TextFormat::simple(egui::FontId::proportional(12.0), rec_color),
+                );
+                let session_btn = ui
+                    .put(session_rect, egui::Button::new(rec_label).frame(false))
+                    .on_hover_text(if is_active { "Stop recording" } else { "Start recording" });
+                if session_btn.clicked() {
+                    let new_state = !is_active;
+                    self.session_active.store(new_state, Ordering::Relaxed);
+                    if !new_state {
+                        self.captions.lock().unwrap().clear();
+                    }
+                }
+
+                // Settings button overlaid to the left of close button
+                let settings_rect = egui::Rect::from_min_size(
+                    egui::pos2(panel_rect.right() - 64.0, panel_rect.top()),
+                    egui::vec2(32.0, 32.0),
+                );
+                let settings_btn = ui.put(
+                    settings_rect,
+                    egui::ImageButton::new(
+                        egui::Image::new(&self.cog_icon)
+                            .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .frame(false),
+                );
+                if settings_btn.clicked() {
+                    self.show_settings = !self.show_settings;
+                    if self.show_settings {
+                        let s = self.settings.lock().unwrap();
+                        self.edit_api_url = s.api_url.clone();
+                        self.edit_api_key = s.api_key.clone();
+                        self.edit_transcribe_model = s.transcribe_model.clone();
+                        self.edit_vocabulary = s.vocabulary.clone();
+                        self.edit_threshold = s.silence_threshold;
+                        self.edit_min_phrase = s.min_phrase_secs;
+                        self.edit_max_phrase = s.max_phrase_secs;
+                        self.edit_language = s.language.clone();
+                        self.edit_font_size = s.font_size;
+                        self.edit_chat_api_url = s.chat_api_url.clone();
+                        self.edit_chat_api_key = s.chat_api_key.clone();
+                        self.edit_chat_model = s.chat_model.clone();
+                        self.edit_target_language = s.target_language.clone();
+                        self.edit_display_mode = s.display_mode.clone();
+                        self.edit_opacity = s.opacity;
+                        self.edit_input_device = s.input_device.clone();
+                        drop(s);
+                        self.input_devices = list_input_devices();
+                    }
+                }
+
+                // Close button overlaid at top-right
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(panel_rect.right() - 32.0, panel_rect.top()),
+                    egui::vec2(32.0, 32.0),
+                );
+                let btn = ui.put(
+                    btn_rect,
+                    egui::ImageButton::new(
+                        egui::Image::new(&self.close_icon)
+                            .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .frame(false),
+                );
+                if btn.clicked() {
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                }
+            });
+    }
+}
+
 impl Drop for App {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
@@ -243,8 +422,27 @@ impl eframe::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        crate::topmost::keep_on_top(frame, self.show_settings);
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::topmost::keep_on_top(self.show_settings);
+
+        // Follow monitors being plugged in or out
+        if self.last_monitor_check.elapsed() > Duration::from_secs(1) {
+            self.last_monitor_check = Instant::now();
+            let count = crate::topmost::monitor_count();
+            if count != self.overlays {
+                self.overlays = count;
+                self.place_in = PLACE_AFTER_FRAMES.to_vec();
+            }
+        }
+        // Snap overlays to their monitors once their windows exist, and again after any
+        // DPI change from moving between monitors has settled
+        self.place_in.retain_mut(|frames| {
+            *frames -= 1;
+            if *frames == 0 {
+                crate::topmost::place_overlays();
+            }
+            *frames > 0
+        });
 
         // Position at bottom of screen on first frame
         if !self.positioned {
@@ -257,27 +455,7 @@ impl eframe::App for App {
             }
         }
 
-        // Edge resize detection
-        let resize_dir = detect_resize_direction(ctx);
-        if let Some(dir) = resize_dir {
-            ctx.set_cursor_icon(match dir {
-                egui::ResizeDirection::North | egui::ResizeDirection::South => {
-                    egui::CursorIcon::ResizeVertical
-                }
-                egui::ResizeDirection::East | egui::ResizeDirection::West => {
-                    egui::CursorIcon::ResizeHorizontal
-                }
-                egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
-                    egui::CursorIcon::ResizeNwSe
-                }
-                egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
-                    egui::CursorIcon::ResizeNeSw
-                }
-            });
-            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
-            }
-        }
+        handle_edge_resize(ctx);
 
         // Settings window (separate OS window)
         if self.show_settings {
@@ -521,154 +699,30 @@ impl eframe::App for App {
             s.save();
         }
 
-        let font_size = self.edit_font_size;
-
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.5);
         self.last_frame = now;
         let revealing = self.captions.lock().unwrap().tick(dt);
 
-        let panel_frame = egui::Frame::new()
-            .fill(egui::Color32::from_black_alpha(self.edit_opacity))
-            .inner_margin(10.0);
-
-        egui::CentralPanel::default()
-            .frame(panel_frame)
-            .show(ctx, |ui| {
-                let panel_rect = ui.max_rect();
-
-                // Drag anywhere to move the window (buttons added later take precedence)
-                let drag = ui.interact(panel_rect, ui.id().with("drag"), egui::Sense::drag());
-                if drag.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-
-                // Rolling captions, leaving a column on the right for the buttons
-                let area = egui::Rect::from_min_max(
-                    panel_rect.left_top(),
-                    egui::pos2(panel_rect.right() - 120.0, panel_rect.bottom()),
-                );
-                // In a short window, shrink the font so at least one line fits
-                let row_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(font_size)));
-                let size = (font_size * (area.height() / row_h).min(1.0)).max(10.0);
-                let big = egui::FontId::proportional(size);
-                let big_row_h = ui.fonts(|f| f.row_height(&big));
-                let caps = self.captions.lock().unwrap();
-                let translating = !self.edit_target_language.is_empty();
-                let main_text = if translating {
-                    caps.translation.parts()
-                } else {
-                    caps.source.parts()
-                };
-                let small = egui::FontId::proportional(size * 0.5);
-                let source_h = ui.fonts(|f| f.row_height(&small)) * 2.0;
-                // Original in two smaller gray lines above the translation, if there's room
-                if translating
-                    && self.edit_display_mode == DisplayMode::Both
-                    && area.height() >= source_h + big_row_h
-                {
-                    let split_y = area.top() + source_h;
-                    let top = egui::Rect::from_min_max(area.left_top(), egui::pos2(area.right(), split_y));
-                    let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), split_y), area.right_bottom());
-                    paint_rolling(ui, top, caps.source.parts(), small, egui::Color32::from_gray(180));
-                    paint_rolling(ui, bottom, main_text, big, egui::Color32::WHITE);
-                } else {
-                    paint_rolling(ui, area, main_text, big, egui::Color32::WHITE);
-                }
-                drop(caps);
-
-                // Session start/stop button: gray "● REC" when idle, red with blinking dot while recording
-                let session_rect = egui::Rect::from_min_size(
-                    egui::pos2(panel_rect.right() - 112.0, panel_rect.top()),
-                    egui::vec2(48.0, 32.0),
-                );
-                let is_active = self.session_active.load(Ordering::Relaxed);
-                let rec_color = if is_active {
-                    egui::Color32::from_rgb(255, 60, 60)
-                } else {
-                    egui::Color32::from_gray(160)
-                };
-                let dot_visible = !is_active || (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
-                let mut rec_label = egui::text::LayoutJob::default();
-                rec_label.append(
-                    "● ",
-                    0.0,
-                    egui::TextFormat::simple(
-                        egui::FontId::proportional(12.0),
-                        if dot_visible { rec_color } else { egui::Color32::TRANSPARENT },
-                    ),
-                );
-                rec_label.append(
-                    "REC",
-                    0.0,
-                    egui::TextFormat::simple(egui::FontId::proportional(12.0), rec_color),
-                );
-                let session_btn = ui
-                    .put(session_rect, egui::Button::new(rec_label).frame(false))
-                    .on_hover_text(if is_active { "Stop recording" } else { "Start recording" });
-                if session_btn.clicked() {
-                    let new_state = !is_active;
-                    self.session_active.store(new_state, Ordering::Relaxed);
-                    if !new_state {
-                        self.captions.lock().unwrap().clear();
-                    }
-                }
-
-                // Settings button overlaid to the left of close button
-                let settings_rect = egui::Rect::from_min_size(
-                    egui::pos2(panel_rect.right() - 64.0, panel_rect.top()),
-                    egui::vec2(32.0, 32.0),
-                );
-                let settings_btn = ui.put(
-                    settings_rect,
-                    egui::ImageButton::new(
-                        egui::Image::new(&self.cog_icon)
-                            .fit_to_exact_size(egui::vec2(20.0, 20.0)),
-                    )
-                    .frame(false),
-                );
-                if settings_btn.clicked() {
-                    self.show_settings = !self.show_settings;
-                    if self.show_settings {
-                        let s = self.settings.lock().unwrap();
-                        self.edit_api_url = s.api_url.clone();
-                        self.edit_api_key = s.api_key.clone();
-                        self.edit_transcribe_model = s.transcribe_model.clone();
-                        self.edit_vocabulary = s.vocabulary.clone();
-                        self.edit_threshold = s.silence_threshold;
-                        self.edit_min_phrase = s.min_phrase_secs;
-                        self.edit_max_phrase = s.max_phrase_secs;
-                        self.edit_language = s.language.clone();
-                        self.edit_font_size = s.font_size;
-                        self.edit_chat_api_url = s.chat_api_url.clone();
-                        self.edit_chat_api_key = s.chat_api_key.clone();
-                        self.edit_chat_model = s.chat_model.clone();
-                        self.edit_target_language = s.target_language.clone();
-                        self.edit_display_mode = s.display_mode.clone();
-                        self.edit_opacity = s.opacity;
-                        self.edit_input_device = s.input_device.clone();
-                        drop(s);
-                        self.input_devices = list_input_devices();
-                    }
-                }
-
-                // Close button overlaid at top-right
-                let btn_rect = egui::Rect::from_min_size(
-                    egui::pos2(panel_rect.right() - 32.0, panel_rect.top()),
-                    egui::vec2(32.0, 32.0),
-                );
-                let btn = ui.put(
-                    btn_rect,
-                    egui::ImageButton::new(
-                        egui::Image::new(&self.close_icon)
-                            .fit_to_exact_size(egui::vec2(20.0, 20.0)),
-                    )
-                    .frame(false),
-                );
-                if btn.clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
+        // One overlay per monitor, all showing the same captions
+        self.draw_overlay(ctx);
+        for i in 1..self.overlays {
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("overlay", i)),
+                egui::ViewportBuilder::default()
+                    .with_title(crate::topmost::overlay_title(i))
+                    .with_inner_size([800.0, 500.0])
+                    .with_min_inner_size([200.0, 40.0])
+                    .with_decorations(false)
+                    .with_transparent(true)
+                    .with_resizable(true)
+                    .with_always_on_top(),
+                |ctx, _class| {
+                    handle_edge_resize(ctx);
+                    self.draw_overlay(ctx);
+                },
+            );
+        }
 
         // Repaint faster while words are still being revealed
         ctx.request_repaint_after(Duration::from_millis(if revealing { 50 } else { 200 }));

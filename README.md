@@ -10,6 +10,7 @@ Live Korean speech transcription/translation overlay app. Captures microphone au
 - Separate settings window with API URLs, API keys, language selection, and more
 - Frameless, draggable, resizable overlay window
 - Rolling captions that flow in word by word
+- One caption overlay per monitor, at the bottom of each screen (macOS/Windows)
 - Stays visible over fullscreen presentations (macOS Spaces / Windows topmost). On macOS the app has no Dock icon.
 - Supports 10 source languages (transcription) and 50+ target languages (translation)
 
