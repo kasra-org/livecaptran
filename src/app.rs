@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::audio::start_audio_and_transcription;
-use crate::captions::Captions;
+use crate::captions::{Captions, Shown};
 use crate::settings::{DisplayMode, Settings, SOURCE_LANGUAGES, TARGET_LANGUAGES};
 
 fn setup_korean_fonts(ctx: &egui::Context) {
@@ -48,17 +48,30 @@ fn load_icon(ctx: &egui::Context, name: &str, png_bytes: &[u8]) -> egui::Texture
 
 const RESIZE_BORDER: f32 = 8.0;
 const PLACE_AFTER_FRAMES: [u32; 2] = [3, 15];
+const ROWS_KEPT_ABOVE: usize = 20; // laid-out lines kept above the visible ones
 
-/// Draws wrapped text in `rect`, bottom-aligned, keeping only the newest lines that fit
-/// so older lines scroll off the top. Unconfirmed `tentative` words follow, dimmed.
+/// Draws wrapped captions in `rect` with the newest line at the bottom; older lines
+/// scroll off the top. Only committed text moves on to a new line: unconfirmed words
+/// (dimmed) that don't fit on the current last line stay hidden until committed, so
+/// revisions never make the lines jump back and forth.
 fn paint_rolling(
     ui: &egui::Ui,
     rect: egui::Rect,
-    (text, tentative): &(String, String),
+    id: egui::Id,
+    shown: &Shown,
     font: egui::FontId,
     color: egui::Color32,
 ) {
-    let text = if text.is_empty() && tentative.is_empty() { "..." } else { text.as_str() };
+    // Lay out from a remembered line start. Appended text never re-wraps earlier lines,
+    // so the lines on screen stay put even as old text is trimmed off the front.
+    let start = ui
+        .data(|d| d.get_temp::<usize>(id))
+        .filter(|&s| s.checked_sub(shown.offset).is_some_and(|i| shown.fixed.is_char_boundary(i)))
+        .unwrap_or(shown.offset);
+    let fixed = &shown.fixed[start - shown.offset..];
+    let tentative = shown.tentative.as_str();
+    let text = if fixed.is_empty() && tentative.is_empty() { "..." } else { fixed };
+
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = rect.width();
     job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
@@ -71,20 +84,35 @@ fn paint_rolling(
         );
     }
     let galley = ui.fonts(|f| f.layout_job(job));
-    // The last line sits at the bottom; lines that don't fit are above the top edge
-    let top = rect.bottom() - galley.size().y;
-    // Hide a line that would be cut in half at the top
-    let excess = rect.top() - top;
-    let visible_top = if excess > 0.0 {
-        let first_whole = galley.rows.iter().map(|r| r.rect.top()).find(|&t| t >= excess);
-        top + first_whole.unwrap_or(excess)
-    } else {
-        rect.top()
-    };
-    let clip = egui::Rect::from_min_max(egui::pos2(rect.left(), visible_top), rect.max);
+    let rows = &galley.rows;
+
+    // The bottom line is the one where committed text (section 0) ends
+    let last = rows
+        .iter()
+        .rposition(|r| r.glyphs.iter().any(|g| g.section_index == 0))
+        .unwrap_or(0);
+    let bottom = rows[last].rect.bottom();
+    // Topmost line that fits whole
+    let first = (0..=last)
+        .find(|&i| bottom - rows[i].rect.top() <= rect.height() + 0.5)
+        .unwrap_or(last);
+    let top = rect.bottom() - bottom;
+    let clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), (top + rows[first].rect.top()).max(rect.top())),
+        rect.max,
+    );
     ui.painter()
         .with_clip_rect(clip)
-        .galley(egui::pos2(rect.left(), top), galley, color);
+        .galley(egui::pos2(rect.left(), top), galley.clone(), color);
+
+    // Forget lines far above the visible ones (always committed text, so `text` is `fixed`)
+    let mut new_start = start;
+    if first > 2 * ROWS_KEPT_ABOVE {
+        let row = first - ROWS_KEPT_ABOVE;
+        let chars: usize = rows[..row].iter().map(|r| r.char_count_including_newline()).sum();
+        new_start += text.char_indices().nth(chars).map_or(text.len(), |(i, _)| i);
+    }
+    ui.data_mut(|d| d.insert_temp(id, new_start));
 }
 
 fn detect_resize_direction(ctx: &egui::Context) -> Option<egui::ResizeDirection> {
@@ -294,10 +322,13 @@ impl App {
                 let big_row_h = ui.fonts(|f| f.row_height(&big));
                 let (source, translation) = {
                     let caps = self.captions.lock().unwrap();
-                    (caps.source.parts(), caps.translation.parts())
+                    (caps.source.shown(), caps.translation.shown())
                 };
                 let translating = !self.edit_target_language.is_empty();
                 let main_text = if translating { &translation } else { &source };
+                // Layout state per window and text
+                let id = egui::Id::new(("rolling", ctx.viewport_id()));
+                let main_id = id.with(if translating { "translation" } else { "source" });
                 let small = egui::FontId::proportional(size * 0.5);
                 let source_h = ui.fonts(|f| f.row_height(&small)) * 2.0;
                 // Original in two smaller gray lines above the translation, if there's room
@@ -308,10 +339,11 @@ impl App {
                     let split_y = area.top() + source_h;
                     let top = egui::Rect::from_min_max(area.left_top(), egui::pos2(area.right(), split_y));
                     let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), split_y), area.right_bottom());
-                    paint_rolling(ui, top, &source, small, egui::Color32::from_gray(180));
-                    paint_rolling(ui, bottom, main_text, big, egui::Color32::WHITE);
+                    let gray = egui::Color32::from_gray(180);
+                    paint_rolling(ui, top, id.with("source above"), &source, small, gray);
+                    paint_rolling(ui, bottom, main_id, main_text, big, egui::Color32::WHITE);
                 } else {
-                    paint_rolling(ui, area, main_text, big, egui::Color32::WHITE);
+                    paint_rolling(ui, area, main_id, main_text, big, egui::Color32::WHITE);
                 }
 
                 // Session start/stop button: gray "● REC" when idle, red with blinking dot while recording

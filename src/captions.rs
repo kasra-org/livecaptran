@@ -4,8 +4,8 @@
 use std::collections::VecDeque;
 
 const WORDS_PER_SEC: f32 = 3.0; // normal reveal speed
-const CATCH_UP_SECS: f32 = 2.0; // with a backlog, speed up to show it within this time
-const MAX_CHARS: usize = 2000; // only the newest lines fit on screen anyway
+const CATCH_UP_SECS: f32 = 1.0; // with a backlog, speed up to show it within this time
+const MAX_CHARS: usize = 20000; // only the newest lines fit on screen anyway
 
 // Chinese/Japanese have no spaces, so each character is its own unit
 fn is_cjk(c: char) -> bool {
@@ -36,10 +36,18 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
+/// What a caption currently shows.
+pub struct Shown {
+    pub fixed: String,     // revealed committed text
+    pub tentative: String, // revealed tentative words, drawn dimmed after it
+    pub offset: usize,     // bytes of committed text trimmed off before `fixed`
+}
+
 #[derive(Default)]
 pub struct Caption {
     fixed: VecDeque<String>, // committed words
     fixed_len: usize,        // their total length in bytes
+    trimmed: usize,          // bytes of old committed text dropped from the front
     tentative: Vec<String>,  // unconfirmed words after them, which may still change
     revealed: usize,         // words of fixed + tentative shown so far
     owed: f32,               // fractional words carried between ticks
@@ -70,6 +78,7 @@ impl Caption {
                 break;
             };
             self.fixed_len -= old.len();
+            self.trimmed += old.len();
             self.revealed = self.revealed.saturating_sub(1);
         }
         self.tentative = tokenize(tentative);
@@ -93,11 +102,13 @@ impl Caption {
         self.revealed < self.total()
     }
 
-    /// Revealed committed text and revealed tentative text (drawn dimmed after it).
-    pub fn parts(&self) -> (String, String) {
+    pub fn shown(&self) -> Shown {
         let fixed_shown = self.revealed.min(self.fixed.len());
-        let fixed = self.fixed.iter().take(fixed_shown).map(String::as_str).collect();
-        (fixed, self.tentative[..self.revealed - fixed_shown].concat())
+        Shown {
+            fixed: self.fixed.iter().take(fixed_shown).map(String::as_str).collect(),
+            tentative: self.tentative[..self.revealed - fixed_shown].concat(),
+            offset: self.trimmed,
+        }
     }
 
     pub fn clear(&mut self) {
@@ -137,8 +148,8 @@ mod tests {
 
     // "fixed|tentative"
     fn shown(c: &Caption) -> String {
-        let (fixed, tentative) = c.parts();
-        format!("{fixed}|{tentative}")
+        let s = c.shown();
+        format!("{}|{}", s.fixed, s.tentative)
     }
 
     #[test]
@@ -194,12 +205,14 @@ mod tests {
     #[test]
     fn trims_old_text() {
         let mut c = Caption::default();
-        for _ in 0..500 {
+        for _ in 0..2000 {
             c.update("가나다라 마바사", "");
             while c.tick(1.0) {}
         }
-        let (fixed, _) = c.parts();
-        assert!(fixed.len() <= MAX_CHARS);
-        assert!(fixed.starts_with("가나다라") || fixed.starts_with("마바사"));
+        let s = c.shown();
+        assert!(s.fixed.len() <= MAX_CHARS);
+        assert!(s.fixed.starts_with("가나다라") || s.fixed.starts_with("마바사"));
+        // Offsets of the remaining text stay valid
+        assert_eq!(s.offset + s.fixed.len(), 2000 * "가나다라 마바사 ".len() - 1);
     }
 }

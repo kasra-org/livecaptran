@@ -51,7 +51,7 @@ Transcribes audio file to text.
 
 - Frameless overlay window, screen-wide (left=0), height=500px (resizable down to 40px; font shrinks to fit one line)
 - Black semi-transparent background
-- White text, 60pt, rolling captions revealed word by word (older lines scroll off the top)
+- White text, 60pt, rolling captions revealed word by word (older lines scroll off the top). Only committed text starts a new line: unconfirmed words that overflow the last line wait until committed, and wrapped lines never re-wrap
 - One overlay per monitor (macOS/Windows), each snapped to the bottom of its monitor at full width; windows titled "LiveCapTran", "LiveCapTran 2", …
 - Stays above fullscreen presentations: macOS joins all Spaces (app runs as Accessory, no Dock icon); Windows re-asserts topmost
 - Small X close button at top-right

@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::audio::{read_wav, start_audio_and_transcription};
-use crate::captions::{Caption, Captions};
+use crate::captions::{Caption, Captions, Shown};
 use crate::settings::Settings;
 
 struct Seen {
@@ -19,7 +19,7 @@ struct Seen {
 }
 
 fn report(label: &str, caption: &Caption, seen: &mut Seen, elapsed: f32) {
-    let (fixed, tentative) = caption.parts();
+    let Shown { fixed, tentative, .. } = caption.shown();
     // Older text may be trimmed from the front, so fall back to printing the whole thing
     let added = fixed.get(seen.fixed_len..).unwrap_or(&fixed).trim();
     if !added.is_empty() || tentative != seen.tentative {
@@ -68,6 +68,6 @@ pub fn run(input: Option<PathBuf>) {
     running.store(false, Ordering::Relaxed);
 
     let caps = captions.lock().unwrap();
-    println!("\n=== Source ===\n{}", caps.source.parts().0);
-    println!("\n=== Translation ===\n{}", caps.translation.parts().0);
+    println!("\n=== Source ===\n{}", caps.source.shown().fixed);
+    println!("\n=== Translation ===\n{}", caps.translation.shown().fixed);
 }
