@@ -58,7 +58,7 @@ Transcribes audio file to text.
 - Draggable via mouse drag
 - Captures live microphone audio, sends chunks to transcription API, displays results in real-time
 - Phrases are cut at pauses between min/max length (settings), forced at the quietest point when max is reached
-- Streaming: the phrase in progress is re-transcribed every 1s; agreed words are shown at once (unconfirmed tail dimmed)
+- Streaming: the phrase in progress is re-transcribed every 1s; new words flow in right away, dimmed until two consecutive transcriptions agree, then turn solid in place (nothing already shown is hidden and re-revealed)
 - Vocabulary hints (settings) go to Whisper as `prompt` and to the translator; output that just recites the terms is dropped
 - Translation streams too: the sentence so far is re-translated on each update, asking the model to keep the on-screen words; translated words two consecutive results agree on are fixed, only the dimmed tail can change
 

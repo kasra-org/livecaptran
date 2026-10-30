@@ -11,6 +11,7 @@ pub fn overlay_title(index: usize) -> String {
 }
 
 /// Overlay index from a window title; None for other windows such as settings.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn overlay_index(title: &str) -> Option<usize> {
     match title.strip_prefix("LiveCapTran")? {
         "" => Some(0),

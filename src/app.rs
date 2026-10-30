@@ -54,11 +54,11 @@ const PLACE_AFTER_FRAMES: [u32; 2] = [3, 15];
 fn paint_rolling(
     ui: &egui::Ui,
     rect: egui::Rect,
-    (text, tentative): (&str, &str),
+    (text, tentative): &(String, String),
     font: egui::FontId,
     color: egui::Color32,
 ) {
-    let text = if text.is_empty() && tentative.is_empty() { "..." } else { text };
+    let text = if text.is_empty() && tentative.is_empty() { "..." } else { text.as_str() };
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = rect.width();
     job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
@@ -71,20 +71,20 @@ fn paint_rolling(
         );
     }
     let galley = ui.fonts(|f| f.layout_job(job));
-    let excess = galley.size().y - rect.height();
-    // Scroll by whole lines so the top line isn't cut in half
-    let shift = if excess > 0.0 {
-        galley
-            .rows
-            .iter()
-            .map(|r| r.rect.top())
-            .find(|&top| top >= excess)
-            .unwrap_or(excess)
+    // The last line sits at the bottom; lines that don't fit are above the top edge
+    let top = rect.bottom() - galley.size().y;
+    // Hide a line that would be cut in half at the top
+    let excess = rect.top() - top;
+    let visible_top = if excess > 0.0 {
+        let first_whole = galley.rows.iter().map(|r| r.rect.top()).find(|&t| t >= excess);
+        top + first_whole.unwrap_or(excess)
     } else {
-        0.0
+        rect.top()
     };
-    let pos = egui::pos2(rect.left(), rect.bottom() - (galley.size().y - shift));
-    ui.painter().with_clip_rect(rect).galley(pos, galley, color);
+    let clip = egui::Rect::from_min_max(egui::pos2(rect.left(), visible_top), rect.max);
+    ui.painter()
+        .with_clip_rect(clip)
+        .galley(egui::pos2(rect.left(), top), galley, color);
 }
 
 fn detect_resize_direction(ctx: &egui::Context) -> Option<egui::ResizeDirection> {
@@ -292,13 +292,12 @@ impl App {
                 let size = (font_size * (area.height() / row_h).min(1.0)).max(10.0);
                 let big = egui::FontId::proportional(size);
                 let big_row_h = ui.fonts(|f| f.row_height(&big));
-                let caps = self.captions.lock().unwrap();
-                let translating = !self.edit_target_language.is_empty();
-                let main_text = if translating {
-                    caps.translation.parts()
-                } else {
-                    caps.source.parts()
+                let (source, translation) = {
+                    let caps = self.captions.lock().unwrap();
+                    (caps.source.parts(), caps.translation.parts())
                 };
+                let translating = !self.edit_target_language.is_empty();
+                let main_text = if translating { &translation } else { &source };
                 let small = egui::FontId::proportional(size * 0.5);
                 let source_h = ui.fonts(|f| f.row_height(&small)) * 2.0;
                 // Original in two smaller gray lines above the translation, if there's room
@@ -309,12 +308,11 @@ impl App {
                     let split_y = area.top() + source_h;
                     let top = egui::Rect::from_min_max(area.left_top(), egui::pos2(area.right(), split_y));
                     let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), split_y), area.right_bottom());
-                    paint_rolling(ui, top, caps.source.parts(), small, egui::Color32::from_gray(180));
+                    paint_rolling(ui, top, &source, small, egui::Color32::from_gray(180));
                     paint_rolling(ui, bottom, main_text, big, egui::Color32::WHITE);
                 } else {
                     paint_rolling(ui, area, main_text, big, egui::Color32::WHITE);
                 }
-                drop(caps);
 
                 // Session start/stop button: gray "● REC" when idle, red with blinking dot while recording
                 let session_rect = egui::Rect::from_min_size(

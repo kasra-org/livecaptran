@@ -401,24 +401,19 @@ fn spawn_translator(
                         new.push_str(&agreement.partial(full).0);
                         tentative.clear();
                     }
-                    let mut caps = captions.lock().unwrap();
-                    caps.translation.push(&new);
-                    caps.translation.set_tentative(&tentative);
+                    captions.lock().unwrap().translation.update(&new, &tentative);
                 }
             }
 
             if sentence_end {
-                let mut caps = captions.lock().unwrap();
-                if on_screen.is_empty() {
-                    // Fall back to the original if translation failed
-                    if reply.is_none() {
-                        caps.translation.push(&source);
-                    }
+                let rest = if !on_screen.is_empty() {
+                    agreement.finalize(Some(&on_screen), false)
+                } else if reply.is_none() {
+                    source.clone() // fall back to the original if translation failed
                 } else {
-                    caps.translation.push(&agreement.finalize(Some(&on_screen), false));
-                }
-                caps.translation.set_tentative("");
-                drop(caps);
+                    String::new()
+                };
+                captions.lock().unwrap().translation.update(&rest, "");
                 if !on_screen.is_empty() {
                     log_line(&log, &format!("→ {on_screen}"));
                     history.push_back((source.clone(), on_screen.clone()));
@@ -691,10 +686,9 @@ pub fn start_audio_and_transcription(
                     }
                     Some(text)
                 };
-                let commit = |text: &str, sentence_end: bool| {
-                    if !text.trim().is_empty() {
-                        captions.lock().unwrap().source.push(text);
-                    }
+                // Shows newly agreed text with the new tentative tail, and passes it on to translation
+                let commit = |text: &str, tentative: &str, sentence_end: bool| {
+                    captions.lock().unwrap().source.update(text, tentative);
                     if translating && (!text.trim().is_empty() || sentence_end) {
                         let _ = translate_tx.send(TranslateUpdate {
                             text: text.to_string(),
@@ -713,8 +707,7 @@ pub fn start_audio_and_transcription(
                     }
                     let rest = agreement.finalize(text.as_deref(), phrase.continues);
                     // Phrases often end mid-sentence, so only punctuation ends one here
-                    commit(&rest, ends_sentence(text.as_deref().unwrap_or(&rest)));
-                    captions.lock().unwrap().source.set_tentative("");
+                    commit(&rest, "", ends_sentence(text.as_deref().unwrap_or(&rest)));
                     last_partial_len = 0;
                 }
 
@@ -726,8 +719,7 @@ pub fn start_audio_and_transcription(
                         last_partial_len = current.len();
                         if let Some(text) = transcribe(current) {
                             let (new, tentative) = agreement.partial(&text);
-                            commit(&new, ends_sentence(&new));
-                            captions.lock().unwrap().source.set_tentative(&tentative);
+                            commit(&new, &tentative, ends_sentence(&new));
                         }
                     }
                 }

@@ -21,12 +21,12 @@ struct Seen {
 fn report(label: &str, caption: &Caption, seen: &mut Seen, elapsed: f32) {
     let (fixed, tentative) = caption.parts();
     // Older text may be trimmed from the front, so fall back to printing the whole thing
-    let added = fixed.get(seen.fixed_len..).unwrap_or(fixed).trim();
+    let added = fixed.get(seen.fixed_len..).unwrap_or(&fixed).trim();
     if !added.is_empty() || tentative != seen.tentative {
         println!("[{elapsed:6.1}s] {label} + {added}  ~ {tentative}");
     }
     seen.fixed_len = fixed.len();
-    seen.tentative = tentative.to_string();
+    seen.tentative = tentative;
 }
 
 pub fn run(input: Option<PathBuf>) {
